@@ -1,0 +1,24 @@
+# Credentials
+.env
+
+# Dataset and model weights (large files)
+data/raw/
+data/processed/
+models/
+runs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
