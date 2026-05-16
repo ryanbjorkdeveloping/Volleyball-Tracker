@@ -18,7 +18,7 @@ class BallTracker:
       - 'local':  local YOLOv8 .pt weights with ByteTrack
     """
 
-    def __init__(self, mode: str = "hosted", model_path: str | None = None, conf: float = 0.4):
+    def __init__(self, mode: str = "hosted", model_path: str | None = None, conf: float = 0.15):
         self.mode = mode
         self.conf = conf
 
