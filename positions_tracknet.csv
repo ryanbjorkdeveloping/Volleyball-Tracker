@@ -1,0 +1,6 @@
+frame,time_s,x_pixel,y_pixel,confidence,source
+140,3.0348,1329,945,0.6633,tracknet
+141,3.0564,1269,1007,0.6588,tracknet
+142,3.0781,1209,1083,0.6341,tracknet
+151,3.2732,1015,1083,0.6363,tracknet
+154,3.3382,1042,891,0.7806,tracknet
