@@ -38,9 +38,9 @@ class CVBallTracker:
 
         self._initialized = False
         self._frames_since_detect = 0
-        self._max_coast = 5
-        self._confirm_buffer = []   # recent circles pending lock-on confirmation
-        self._confirm_needed = 2    # need N consecutive frames before locking on
+        self._max_coast = 20           # coast longer to bridge fast-motion gaps
+        self._confirm_buffer = []      # recent circles pending lock-on confirmation
+        self._confirm_needed = 1       # lock on immediately — fast balls need single-frame init
 
     def detect_frame(self, frame: np.ndarray) -> list[dict]:
         inv_scale = 1.0 / _SCALE

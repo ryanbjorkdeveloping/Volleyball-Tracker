@@ -33,8 +33,8 @@ from src.detection.yolo_detector import YOLOBallDetector
 _AGREE_DIST      = 180   # px — models "agree" when detections are this close
 _CONF_BOOST      = 1.25  # multiply fused confidence when both models agree
 _INTERP_MAX_GAP  = 20    # only interpolate gaps ≤ this many frames
-_ZOOM_HW         = 450   # guided zoom half-width
-_ZOOM_HH         = 350   # guided zoom half-height
+_ZOOM_HW         = 250   # guided zoom half-width (tighter = ball bigger in model input)
+_ZOOM_HH         = 200   # guided zoom half-height
 
 
 def _fuse(a: dict | None, b: dict | None) -> dict | None:
@@ -266,24 +266,25 @@ def process_video(
     COURT     = (int(H*0.08), int(H*0.82), 0, W)
     # Play-area spatial filter — court zone only, excludes ad boards and floor
     # y2=0.60 cuts off shoes/floor; ad boards are excluded by tight y1=0.18
-    PLAY      = dict(x1=int(W*0.05), x2=int(W*0.52),
-                     y1=int(H*0.18), y2=int(H*0.60))
+    # Wider than original to capture serve (full width, top 8% and bottom 20% cut)
+    PLAY      = dict(x1=int(W*0.02), x2=int(W*0.98),
+                     y1=int(H*0.08), y2=int(H*0.80))
     BOUNCE_Y  = H * 0.52
 
     def in_play(x, y):
         return PLAY["x1"] <= x <= PLAY["x2"] and PLAY["y1"] <= y <= PLAY["y2"]
 
     def _is_static(pos_history: list, x: float, y: float,
-                   window: int = 4, tol: float = 20.0) -> bool:
+                   window: int = 2, tol: float = 15.0) -> bool:
         """Return True if (x,y) appeared at basically the same spot in recent frames."""
         if len(pos_history) < window:
             return False
         recent = [p for p in pos_history[-window:] if p is not None]
-        if len(recent) < window - 1:
+        if not recent:
             return False
         matches = sum(1 for px, py in recent
                       if abs(px - x) < tol and abs(py - y) < tol)
-        return matches >= window - 1
+        return matches >= len(recent)
 
     # ── Load models ───────────────────────────────────────────────────────────
     print("Loading models...")
@@ -350,7 +351,74 @@ def process_video(
         d = best[f]
         print(f"    f{f:3d}: ({d['x']:.0f},{d['y']:.0f}) conf={d['confidence']:.3f} [{d['source']}]")
 
-    # ── Pass 2: guided zoom on gaps ───────────────────────────────────────────
+    # ── Continuity filter: drop detections that jump too far between frames ───
+    # Cap absolute max displacement at 300 px regardless of gap size — prevents
+    # false positives on opposite sides of the frame being grouped together.
+    _MAX_DISP = 300.0        # absolute max pixel displacement between any two consecutive dets
+    _MAX_PX_PER_FRAME = 250.0  # also scale with gap (whichever is smaller)
+
+    def _build_segments(dets: dict) -> list[list[int]]:
+        frames = sorted(dets.keys())
+        if not frames:
+            return []
+        segs, cur = [], [frames[0]]
+        for i in range(1, len(frames)):
+            f0, f1 = frames[i-1], frames[i]
+            d0, d1 = dets[f0], dets[f1]
+            dist = ((d0["x"]-d1["x"])**2 + (d0["y"]-d1["y"])**2) ** 0.5
+            gap = f1 - f0
+            # Static-object guard: near-identical positions far apart in time
+            # (real balls always move; logos/heads don't)
+            if dist < 25.0 and gap > 8:
+                segs.append(cur); cur = [f1]; continue
+            max_allowed = min(_MAX_PX_PER_FRAME * gap, _MAX_DISP)
+            if dist <= max_allowed:
+                cur.append(f1)
+            else:
+                segs.append(cur); cur = [f1]
+        segs.append(cur)
+        return segs
+
+    segments = _build_segments(best)
+    if len(segments) > 1:
+        # Score: total confidence + length bonus (no motion term — it rewards noise)
+        def _score(seg):
+            return sum(best[f]["confidence"] for f in seg) + len(seg) * 0.1
+        best_seg = max(segments, key=_score)
+
+        # Stitch segments that are directly reachable from the kept segment's
+        # endpoints — bypasses false-positive detections sandwiched between them.
+        kept = set(best_seg)
+        lo, hi = min(kept), max(kept)
+        changed = True
+        while changed:
+            changed = False
+            for seg in segments:
+                if all(f in kept for f in seg):
+                    continue
+                seg_lo, seg_hi = min(seg), max(seg)
+                # Try connecting to high endpoint
+                if seg_lo > hi:
+                    gap = seg_lo - hi
+                    d = ((best[hi]["x"] - best[seg_lo]["x"])**2 +
+                         (best[hi]["y"] - best[seg_lo]["y"])**2) ** 0.5
+                    if gap <= _INTERP_MAX_GAP and d <= min(_MAX_PX_PER_FRAME * gap, _MAX_DISP):
+                        kept.update(seg); hi = max(hi, seg_hi); changed = True
+                # Try connecting to low endpoint
+                elif seg_hi < lo:
+                    gap = lo - seg_hi
+                    d = ((best[seg_hi]["x"] - best[lo]["x"])**2 +
+                         (best[seg_hi]["y"] - best[lo]["y"])**2) ** 0.5
+                    if gap <= _INTERP_MAX_GAP and d <= min(_MAX_PX_PER_FRAME * gap, _MAX_DISP):
+                        kept.update(seg); lo = min(lo, seg_lo); changed = True
+
+        dropped = len(best) - len(kept)
+        print(f"  Continuity filter: kept {len(kept)} frames "
+              f"({len(kept)-len(best_seg)} stitched), "
+              f"dropped {dropped} frames from {len(segments)-1} other segment(s)")
+        best = {f: best[f] for f in kept}
+
+    # ── Pass 2: guided zoom — fill within AND between segments ────────────────
     print("\nPass 2: guided zoom on gaps...")
     det_frames = sorted(best.keys())
     new_found  = 0
@@ -358,7 +426,7 @@ def process_video(
     for i in range(len(det_frames) - 1):
         f0, f1 = det_frames[i], det_frames[i+1]
         gap = f1 - f0
-        if gap <= 1 or gap > 30:
+        if gap <= 1 or gap > 80:   # allow bridging larger inter-segment gaps
             continue
         x0, y0 = best[f0]["x"], best[f0]["y"]
         x1_, y1_ = best[f1]["x"], best[f1]["y"]
@@ -404,6 +472,90 @@ def process_video(
                           f"conf={fused['confidence']:.3f} [{fused['source']}]")
 
     print(f"  New detections from zoom: {new_found}")
+
+    # ── Pass 2b: trajectory extension — zoom backward/forward from endpoints ──
+    # Use velocity from the first/last 3 real detections in the kept segment.
+    print("\nPass 2b: trajectory extension from segment endpoints...")
+    _EXT_FRAMES  = 30   # how many frames to search beyond each endpoint
+    _EXT_ZOOM_HW = 180  # tighter window so ball appears larger in model input
+    _EXT_ZOOM_HH = 140
+    ext_found = 0
+
+    sorted_det = sorted(best.keys())
+
+    def _zoom_at(gi, kx, ky):
+        """Run zoomed TrackNetV2 at predicted position. Returns det or None."""
+        if gi < _FRAMES_IN - 1 or gi >= total:
+            return None
+        zx1 = max(0, int(kx) - _EXT_ZOOM_HW)
+        zy1 = max(0, int(ky) - _EXT_ZOOM_HH)
+        zx2 = min(W, zx1 + _EXT_ZOOM_HW * 2)
+        zy2 = min(H, zy1 + _EXT_ZOOM_HH * 2)
+        zoom = (zy1, zy2, zx1, zx2)
+        zt = [_preprocess_frame(frames_raw[gi-2], zoom),
+              _preprocess_frame(frames_raw[gi-1], zoom),
+              _preprocess_frame(frames_raw[gi],   zoom)]
+        hms = _run_inference_raw(tn_model, tn_device, zt)
+        s = float(hms[2].max())
+        if s < 0.05:
+            return None
+        py, px = np.unravel_index(np.argmax(hms[2]), hms[2].shape)
+        rx = float(px * (zx2-zx1) / _INP_W + zx1)
+        ry = float(py * (zy2-zy1) / _INP_H + zy1)
+        if ((rx-kx)**2 + (ry-ky)**2) ** 0.5 > _EXT_ZOOM_HW * 0.8:
+            return None
+        return {"x": rx, "y": ry, "confidence": s,
+                "width": 30.0, "height": 30.0,
+                "class": "volleyball", "source": "tracknet"}
+
+    if len(sorted_det) >= 2:
+        # ── Backward extension: velocity from first 2 anchor frames ───────
+        f_a, f_b = sorted_det[0], sorted_det[min(2, len(sorted_det)-1)]
+        vx = (best[f_b]["x"] - best[f_a]["x"]) / max(1, f_b - f_a)
+        vy = (best[f_b]["y"] - best[f_a]["y"]) / max(1, f_b - f_a)
+        anchor = f_a
+        for step in range(1, _EXT_FRAMES + 1):
+            gi = anchor - 1
+            if gi < _FRAMES_IN - 1 or gi in best:
+                break
+            kx = float(np.clip(best[anchor]["x"] - vx, 0, W - 1))
+            ky = float(np.clip(best[anchor]["y"] - vy, 0, H - 1))
+            det = _zoom_at(gi, kx, ky)
+            if det is None:
+                break
+            best[gi] = det
+            ext_found += 1
+            sorted_det = sorted(best.keys())
+            anchor = gi
+            # Update velocity from latest 2 anchors
+            nxt = sorted_det[sorted_det.index(gi) + 1]
+            vx = (best[nxt]["x"] - det["x"]) / max(1, nxt - gi)
+            vy = (best[nxt]["y"] - det["y"]) / max(1, nxt - gi)
+
+        # ── Forward extension: velocity from last 2 anchor frames ─────────
+        sorted_det = sorted(best.keys())
+        f_c = sorted_det[max(0, len(sorted_det)-3)]
+        f_d = sorted_det[-1]
+        vx = (best[f_d]["x"] - best[f_c]["x"]) / max(1, f_d - f_c)
+        vy = (best[f_d]["y"] - best[f_c]["y"]) / max(1, f_d - f_c)
+        anchor = f_d
+        for step in range(1, _EXT_FRAMES + 1):
+            gi = anchor + 1
+            if gi >= total or gi in best:
+                break
+            kx = float(np.clip(best[anchor]["x"] + vx, 0, W - 1))
+            ky = float(np.clip(best[anchor]["y"] + vy, 0, H - 1))
+            det = _zoom_at(gi, kx, ky)
+            if det is None:
+                break
+            best[gi] = det
+            ext_found += 1
+            anchor = gi
+            prev = sorted(best.keys())[-2]
+            vx = (det["x"] - best[prev]["x"]) / max(1, gi - prev)
+            vy = (det["y"] - best[prev]["y"]) / max(1, gi - prev)
+
+    print(f"  Extension found {ext_found} additional frames")
 
     # ── Pass 3: interpolate remaining gaps ────────────────────────────────────
     print("\nPass 3: interpolating remaining gaps...")

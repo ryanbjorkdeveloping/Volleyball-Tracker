@@ -62,10 +62,11 @@ All modes are selected via `--mode` in `scripts/track_video.py`.
 
 `process_video()` in `src/detection/fusion_tracker.py` runs 4 passes:
 
-1. **Pass 1** — TrackNetV2 (all 3 heatmap slots per triplet) + YOLOv8 on every frame. Positions filtered to play area (`PLAY` dict: 5–52% x, 18–60% y of frame). Static-object guard prevents YOLO from locking on logos/ad boards.
-2. **Pass 2** — Guided zoom: for frames with no detection between two known detections (gap ≤ 30), interpolate a guide point, then run both models on a tight crop (`_ZOOM_HW=450`, `_ZOOM_HH=350`). Reject if detected position is > 65% of zoom half-width from guide.
-3. **Pass 3** — Linear interpolation through remaining gaps ≤ `_INTERP_MAX_GAP=20` frames. These get `source="interp"`.
-4. **Pass 4** — Render annotated video with fading trail (30 frames) and confidence labels.
+1. **Pass 1** — TrackNetV2 (all 3 heatmap slots per triplet) + YOLOv8 on every frame. Positions filtered to play area (`PLAY` dict: 2–98% x, 8–80% y of frame). Static-object guard (`window=2, tol=15px`) prevents YOLO from locking on logos/ad boards. After all detections are collected, a **continuity filter** segments them by displacement (`_MAX_DISP=300px`, `_MAX_PX_PER_FRAME=250`) and a static-object guard (near-identical positions >8 frames apart). The best-scoring segment is kept; **segment stitching** then reconnects any other segment whose endpoint is within `_INTERP_MAX_GAP` frames and `_MAX_DISP` displacement from the kept segment's endpoints (bypasses false positives sandwiched between real ball segments).
+2. **Pass 2** — Guided zoom: for frames with no detection between two known detections (gap ≤ 80), interpolate a guide point, then run both models on a tight crop (`_ZOOM_HW=250`, `_ZOOM_HH=200`). Reject if detected position is > 65% of zoom half-width from guide.
+3. **Pass 2b** — Trajectory extension: zoomed inference forward/backward from segment endpoints (up to 30 frames, window `_EXT_ZOOM_HW=180`, `_EXT_ZOOM_HH=140`).
+4. **Pass 3** — Linear interpolation through remaining gaps ≤ `_INTERP_MAX_GAP=20` frames. These get `source="interp"`.
+5. **Pass 4** — Render annotated video with fading trail (30 frames) and confidence labels.
 
 ### Fusion Logic (`_fuse()`)
 - Both detections within `_AGREE_DIST=180px` → weighted-average by confidence, boosted by `_CONF_BOOST=1.25`
@@ -274,13 +275,16 @@ pytest tests/
 | tracknet | `annotated_tracknet.mp4` | TrackNetV2 first run |
 | tracknet_v2–v5 | ... | Iterative improvements |
 | fusion | `annotated_fusion.mp4` | TrackNetV2 + YOLO fusion |
+| fusion_v2–v9 | ... | Iterative improvements to fusion pipeline |
+| fusion_v10 | `annotated_fusion_v10.mp4` | Removed Kalman smoother (was displacing positions), added segment stitching |
 
-Latest working CSVs: `positions_tracknet_v5.csv`, `positions_fusion.csv`
+Latest working CSVs: `positions_tracknet_v5.csv`, `positions_fusion_v10.csv`
 
 ---
 
 ## Gotchas & Non-Obvious Decisions
 
+- The Kalman post-smoothing pass was removed from `process_video()`. With `measurementNoiseCov=10.0` it trusted velocity prediction 1000× more than raw measurements, displacing accurate detections by hundreds of pixels (f137 moved from (1429,820) to (953,547) in v9). Raw detector positions are more accurate than the smoothed ones.
 - `unet2d.py` `forward()` returns `{0: logits}` (dict), not a tensor — callers must do `out[0]` before sigmoid.
 - `TrackNetTracker` and `FusionTracker` use `_init_buf` to require 3 detections within 8 frames before emitting results — this suppresses false positives at video start.
 - YOLO uses COCO class 32 (`sports ball`) not a custom volleyball model. This works reasonably well but can false-positive on heads/round objects.
